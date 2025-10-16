@@ -64,19 +64,45 @@ public static class Transcriber
             var segments = new List<Segment>();
             await using var audioStream = File.OpenRead(wavPath);
 
+            // Durée totale estimée (ms) basée sur PCM 16k mono s16 (32_000 B/s)
+            long totalBytes = new FileInfo(wavPath).Length;
+            long totalMs = (long)Math.Round((totalBytes / 32000.0) * 1000.0);
+            if (totalMs <= 0) totalMs = 1;
+
+            int lastPctInfer = -1;
+            static string Hhmmss(long ms)
+            {
+                var s = ms / 1000;
+                var m = s / 60;
+                s %= 60;
+                return $"{m:00}:{s:00}";
+            }
+
             await foreach (var s in processor.ProcessAsync(audioStream))
             {
-                // Start / End sont TimeSpan -> convertir en ms
                 var startMs = (int)s.Start.TotalMilliseconds;
                 var endMs = (int)s.End.TotalMilliseconds;
                 var text = (s.Text ?? string.Empty).Trim();
 
                 if (!string.IsNullOrWhiteSpace(text))
                     segments.Add(new Segment(startMs, endMs, text));
+
+                // ---- Barre de progression d'inférence (basée sur la fin du segment courant) ----
+                var clampedEnd = Math.Min(Math.Max(endMs, 0), (int)totalMs);
+                int pct = (int)Math.Min(99, Math.Round((clampedEnd * 100.0) / totalMs)); // on garde 99% jusqu'à la fin
+                if (pct != lastPctInfer)
+                {
+                    lastPctInfer = pct;
+                    ConsoleProgress.Draw(pct, "[ASR]");
+                }
             }
 
             // 5) Ordonner et retourner
             segments.Sort((a, b) => a.StartMs.CompareTo(b.StartMs));
+
+            // Terminer la barre à 100% + saut de ligne
+            ConsoleProgress.Finish("[ASR]");
+
             onInfo($"[ASR] {segments.Count} segments extraits");
             return segments;
         }
@@ -126,32 +152,43 @@ public static class Transcriber
         await using (var modelStream = await WhisperGgmlDownloader.Default.GetGgmlModelAsync(ggmlType.Value))
         await using (var fileWriter = File.OpenWrite(modelPath))
         {
-            // Progression manuelle (taille inconnue -> on déduit approx via ModelSizeHint)
             var buffer = new byte[1024 * 128];
             int read;
             long total = 0;
             var lastLog = Stopwatch.StartNew();
+            int lastPct = -1;
+
             while ((read = await modelStream.ReadAsync(buffer)) > 0)
             {
                 await fileWriter.WriteAsync(buffer.AsMemory(0, read));
                 total += read;
 
-                if (lastLog.ElapsedMilliseconds > 500)
+                if (lastLog.ElapsedMilliseconds > 100) // rafraîchissement fluide
                 {
                     if (ModelSizeHint.TryGetValue(modelName, out var size))
                     {
-                        var pct = Math.Min(99, (int)(100.0 * total / size));
-                        onInfo($"[Download] {FormatMB(total)} MB — ~{pct}%");
+                        var pct = (int)Math.Min(99, Math.Round((total * 100.0) / size));
+                        if (pct != lastPct)
+                        {
+                            lastPct = pct;
+                            ConsoleProgress.Draw(pct, "[Download]");
+                        }
                     }
                     else
                     {
-                        onInfo($"[Download] {FormatMB(total)} MB");
+                        // Taille inconnue: on simule un pct qui bouge (mod 100) basé sur les MB lus
+                        var pseudo = (int)((total / (1024.0 * 1024.0)) % 100);
+                        if (pseudo != lastPct)
+                        {
+                            lastPct = pseudo;
+                            ConsoleProgress.Draw(pseudo, "[Download]");
+                        }
                     }
                     lastLog.Restart();
                 }
             }
         }
-
+        ConsoleProgress.Finish("[Download]");
         sw.Stop();
         onInfo($"[Model] OK → {modelPath} ({sw.Elapsed:mm\\:ss})");
         return modelPath;

@@ -44,6 +44,7 @@ internal static class Program
 
             var sw = Stopwatch.StartNew();
 
+            Console.WriteLine();
             var segments = await Transcriber.TranscribeAsync(
                 audioPath: audioPath,
                 modelName: modelName,
